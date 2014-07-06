@@ -1,364 +1,172 @@
-"""
-This tutorial introduces logistic regression using Theano and stochastic
-gradient descent.
+#!/usr/bin/env python2.7
 
-Logistic regression is a probabilistic, linear classifier. It is parametrized
-by a weight matrix :math:`W` and a bias vector :math:`b`. Classification is
-done by projecting data points onto a set of hyperplanes, the distance to
-which is used to determine a class membership probability.
-
-Mathematically, this can be written as:
-
-.. math::
-  P(Y=i|x, W,b) &= softmax_i(W x + b) \\
-                &= \frac {e^{W_i x + b_i}} {\sum_j e^{W_j x + b_j}}
-
-
-The output of the model or prediction is then done by taking the argmax of
-the vector whose i'th element is P(Y=i|x).
-
-.. math::
-
-  y_{pred} = argmax_i P(Y=i|x,W,b)
-
-
-This tutorial presents a stochastic gradient descent optimization method
-suitable for large datasets, and a conjugate gradient optimization method
-that is suitable for smaller datasets.
-
-
-References:
-
-    - textbooks: "Pattern Recognition and Machine Learning" -
-                 Christopher M. Bishop, section 4.3.2
-
-"""
-__docformat__ = 'restructedtext en'
-
-import cPickle
-import gzip
-import os
+import argparse
+import logging
+import os.path
 import sys
 import time
 
-import numpy
-
+import numpy as np
 import theano
 import theano.tensor as T
-from transform_svm import transform_svm
+import ml_util
+
+logger = logging.getLogger( __name__ )
 
 class LogisticRegression(object):
-    """Multi-class Logistic Regression Class
+  def __init__(self, input, n_in, n_out, model_file_name):
+    if os.path.isfile(model_file_name):
+      W_val, b_val = np.load(model_file_name)
+    else:
+      W_val = np.zeros((n_in, n_out), dtype=theano.config.floatX)
+      b_val = np.zeros((n_out,), dtype=theano.config.floatX)
+    self.input = input
+    self.W = theano.shared(value=W_val, name='W', borrow=True)
+    self.b = theano.shared(value=b_val, name='b', borrow=True)
+    self.p_y_given_x = T.nnet.softmax(T.dot(input, self.W) + self.b)
+    self.y_pred = T.argmax(self.p_y_given_x, axis=1)
+    self.params = [self.W, self.b]
 
-    The logistic regression is fully described by a weight matrix :math:`W`
-    and bias vector :math:`b`. Classification is done by projecting data
-    points onto a set of hyperplanes, the distance to which is used to
-    determine a class membership probability.
-    """
+  def negative_log_likelihood(self, y):
+    return -T.mean(T.log(self.p_y_given_x)[T.arange(y.shape[0]), y])
 
-    def __init__(self, input, n_in, n_out):
-        """ Initialize the parameters of the logistic regression
+  def errors(self, y):
+    if y.ndim != self.y_pred.ndim:
+      raise TypeError('y should have the same shape as self.y_pred',
+                      ('y', target.type, 'y_pred', self.y_pred.type))
+    if y.dtype.startswith('int'):
+      return T.mean(T.neq(self.y_pred, y))
+    else:
+      raise NotImplementedError()
 
-        :type input: theano.tensor.TensorType
-        :param input: symbolic variable that describes the input of the
-                      architecture (one minibatch)
+def get_y_pred(model_file_name, test_set_x):
+  W, b = np.load(model_file_name)
+  _p_y_given_x = ml_util.p_y_given_x(test_set_x, W, b)
+  return np.argmax(_p_y_given_x, axis=1)
 
-        :type n_in: int
-        :param n_in: number of input units, the dimension of the space in
-                     which the datapoints lie
-
-        :type n_out: int
-        :param n_out: number of output units, the dimension of the space in
-                      which the labels lie
-
-        """
-
-        # initialize with 0 the weights W as a matrix of shape (n_in, n_out)
-        self.W = theano.shared(value=numpy.zeros((n_in, n_out),
-                                                 dtype=theano.config.floatX),
-                                name='W', borrow=True)
-        # initialize the baises b as a vector of n_out 0s
-        self.b = theano.shared(value=numpy.zeros((n_out,),
-                                                 dtype=theano.config.floatX),
-                               name='b', borrow=True)
-
-        # compute vector of class-membership probabilities in symbolic form
-        self.p_y_given_x = T.nnet.softmax(T.dot(input, self.W) + self.b)
-
-        # compute prediction as class whose probability is maximal in
-        # symbolic form
-        self.y_pred = T.argmax(self.p_y_given_x, axis=1)
-
-        # parameters of the model
-        self.params = [self.W, self.b]
-
-    def negative_log_likelihood(self, y):
-        """Return the mean of the negative log-likelihood of the prediction
-        of this model under a given target distribution.
-
-        .. math::
-
-            \frac{1}{|\mathcal{D}|} \mathcal{L} (\theta=\{W,b\}, \mathcal{D}) =
-            \frac{1}{|\mathcal{D}|} \sum_{i=0}^{|\mathcal{D}|} \log(P(Y=y^{(i)}|x^{(i)}, W,b)) \\
-                \ell (\theta=\{W,b\}, \mathcal{D})
-
-        :type y: theano.tensor.TensorType
-        :param y: corresponds to a vector that gives for each example the
-                  correct label
-
-        Note: we use the mean instead of the sum so that
-              the learning rate is less dependent on the batch size
-        """
-        # y.shape[0] is (symbolically) the number of rows in y, i.e.,
-        # number of examples (call it n) in the minibatch
-        # T.arange(y.shape[0]) is a symbolic vector which will contain
-        # [0,1,2,... n-1] T.log(self.p_y_given_x) is a matrix of
-        # Log-Probabilities (call it LP) with one row per example and
-        # one column per class LP[T.arange(y.shape[0]),y] is a vector
-        # v containing [LP[0,y[0]], LP[1,y[1]], LP[2,y[2]], ...,
-        # LP[n-1,y[n-1]]] and T.mean(LP[T.arange(y.shape[0]),y]) is
-        # the mean (across minibatch examples) of the elements in v,
-        # i.e., the mean log-likelihood across the minibatch.
-        return -T.mean(T.log(self.p_y_given_x)[T.arange(y.shape[0]), y])
-
-    def errors(self, y):
-        """Return a float representing the number of errors in the minibatch
-        over the total number of examples of the minibatch ; zero one
-        loss over the size of the minibatch
-
-        :type y: theano.tensor.TensorType
-        :param y: corresponds to a vector that gives for each example the
-                  correct label
-        """
-
-        # check if y has same dimension of y_pred
-        if y.ndim != self.y_pred.ndim:
-            raise TypeError('y should have the same shape as self.y_pred',
-                ('y', target.type, 'y_pred', self.y_pred.type))
-        # check if y is of the correct datatype
-        if y.dtype.startswith('int'):
-            # the T.neq operator returns a vector of 0s and 1s, where 1
-            # represents a mistake in prediction
-            return T.mean(T.neq(self.y_pred, y))
-        else:
-            raise NotImplementedError()
+def load_data(train_file_name, test_file_name, n_dim):
+  train_set = ml_util.svm2numpy(train_file_name, n_dim)
+  test_set = ml_util.svm2numpy(test_file_name, n_dim)
+  def shared_dataset(data_xy, borrow=True):
+    data_x, data_y = data_xy
+    shared_x = theano.shared(np.asarray(data_x, dtype=theano.config.floatX), borrow=borrow)
+    shared_y = theano.shared(np.asarray(data_y, dtype=theano.config.floatX), borrow=borrow)
+    return shared_x, T.cast(shared_y, 'int32')
+  train_set_x, train_set_y = shared_dataset(train_set)
+  test_set_x, test_set_y = shared_dataset(test_set)
+  return train_set_x, train_set_y, test_set_x, test_set_y
 
 
-def load_data():
-    ''' Loads the dataset
+def sgd_train(train_file_name, test_file_name, model_file_name, n_dim, n_label, learning_rate=0.13, batch_size=600):
+  logger.info('loading data')
+  train_set_x, train_set_y, test_set_x, test_set_y = load_data(train_file_name, test_file_name, n_dim)
+  n_train_batches = train_set_x.get_value(borrow=True).shape[0] / batch_size
+  n_test_batches = test_set_x.get_value(borrow=True).shape[0] / batch_size
 
-    :type dataset: string
-    :param dataset: the path to the dataset (here MNIST)
-    '''
+  logger.info('building the model')
+  idx = T.lscalar()
+  x = T.matrix('x')
+  y = T.ivector('y')
 
-    #############
-    # LOAD DATA #
-    #############
-    print '... loading data'
+  classifier = LogisticRegression(input=x, n_in=n_dim, n_out=n_label, model_file_name=model_file_name)
+  cost = classifier.negative_log_likelihood(y)
 
-    # Load the dataset
-    #train_set, valid_set, test_set = cPickle.load(f)
-    train_set, valid_set, test_set, n_dim, n_label = transform_svm('train.svm', 'valid.svm', 'test.svm')
-    #train_set, valid_set, test_set format: tuple(input, target)
-    #input is an numpy.ndarray of 2 dimensions (a matrix)
-    #witch row's correspond to an example. target is a
-    #numpy.ndarray of 1 dimensions (vector)) that have the same length as
-    #the number of rows in the input. It should give the target
-    #target to the example with the same index in the input.
+  test_model = theano.function(inputs=[idx],
+                               outputs=classifier.errors(y),
+                               givens={
+                                 x: test_set_x[idx * batch_size: (idx + 1) * batch_size],
+                                 y: test_set_y[idx * batch_size: (idx + 1) * batch_size]
+                               })
+  g_W = T.grad(cost=cost, wrt=classifier.W)
+  g_b = T.grad(cost=cost, wrt=classifier.b)
+  updates = [(classifier.W, classifier.W - learning_rate * g_W),
+             (classifier.b, classifier.b - learning_rate * g_b)]
+  train_model = theano.function(inputs=[idx],
+                                outputs=cost,
+                                updates=updates,
+                                givens={
+                                  x: train_set_x[idx * batch_size: (idx + 1) * batch_size],
+                                  y: train_set_y[idx * batch_size: (idx + 1) * batch_size]
+                                })
+  logger.info('training the model')
+  best_test_score = np.inf
+  epoch = 0
+  start_time = time.clock()
+  while True:
+    epoch = epoch + 1
+    for minibatch_idx in xrange(n_train_batches):
+      train_model(minibatch_idx)
+      iter = (epoch - 1) * n_train_batches + minibatch_idx
+      if (iter + 1) % n_train_batches == 0:
+        test_loss = [test_model(i) for i in xrange(n_test_batches)]
+        test_score = np.mean(test_loss)
+        logger.info(('epoch %i, ran for %.5f hr, minibatch %i/%i, test error %f %%') % (epoch, (time.clock() - start_time)/3600.0, minibatch_idx + 1, n_train_batches, test_score * 100.))
+        if test_score < best_test_score:
+          np.save(model_file_name, (classifier.W.get_value(), classifier.b.get_value()))
+          best_test_score = test_score
+          logger.info(('epoch %i, minibatch %i/%i, test error of best model %f %%') % (epoch, minibatch_idx + 1, n_train_batches, best_test_score * 100.))
 
-    def shared_dataset(data_xy, borrow=True):
-        """ Function that loads the dataset into shared variables
-
-        The reason we store our dataset in shared variables is to allow
-        Theano to copy it into the GPU memory (when code is run on GPU).
-        Since copying data into the GPU is slow, copying a minibatch everytime
-        is needed (the default behaviour if the data is not in a shared
-        variable) would lead to a large decrease in performance.
-        """
-        data_x, data_y = data_xy
-        shared_x = theano.shared(numpy.asarray(data_x,
-                                               dtype=theano.config.floatX),
-                                 borrow=borrow)
-        shared_y = theano.shared(numpy.asarray(data_y,
-                                               dtype=theano.config.floatX),
-                                 borrow=borrow)
-        # When storing data on the GPU it has to be stored as floats
-        # therefore we will store the labels as ``floatX`` as well
-        # (``shared_y`` does exactly that). But during our computations
-        # we need them as ints (we use labels as index, and if they are
-        # floats it doesn't make sense) therefore instead of returning
-        # ``shared_y`` we will have to cast it to int. This little hack
-        # lets ous get around this issue
-        return shared_x, T.cast(shared_y, 'int32')
-
-    test_set_x, test_set_y = shared_dataset(test_set)
-    valid_set_x, valid_set_y = shared_dataset(valid_set)
-    train_set_x, train_set_y = shared_dataset(train_set)
-
-    rval = [(train_set_x, train_set_y), (valid_set_x, valid_set_y),
-            (test_set_x, test_set_y), n_dim, n_label]
-    return rval
-
-
-def sgd_optimization_mnist(learning_rate=0.13, n_epochs=1000,
-                           dataset='mnist.pkl.gz',
-                           batch_size=600):
-    """
-    Demonstrate stochastic gradient descent optimization of a log-linear
-    model
-
-    This is demonstrated on MNIST.
-
-    :type learning_rate: float
-    :param learning_rate: learning rate used (factor for the stochastic
-                          gradient)
-
-    :type n_epochs: int
-    :param n_epochs: maximal number of epochs to run the optimizer
-
-    :type dataset: string
-    :param dataset: the path of the MNIST dataset file from
-                 http://www.iro.umontreal.ca/~lisa/deep/data/mnist/mnist.pkl.gz
-
-    """
-    datasets = load_data()
-
-    train_set_x, train_set_y = datasets[0]
-    valid_set_x, valid_set_y = datasets[1]
-    test_set_x, test_set_y = datasets[2]
-    n_dim = datasets[3]
-    n_label = datasets[4]
-
-    # compute number of minibatches for training, validation and testing
-    n_train_batches = train_set_x.get_value(borrow=True).shape[0] / batch_size
-    n_valid_batches = valid_set_x.get_value(borrow=True).shape[0] / batch_size
-    n_test_batches = test_set_x.get_value(borrow=True).shape[0] / batch_size
-
-    ######################
-    # BUILD ACTUAL MODEL #
-    ######################
-    print '... building the model'
-
-    # allocate symbolic variables for the data
-    index = T.lscalar()  # index to a [mini]batch
-    x = T.matrix('x')  # the data is presented as rasterized images
-    y = T.ivector('y')  # the labels are presented as 1D vector of
-                           # [int] labels
-
-    # construct the logistic regression class
-    # Each MNIST image has size 28*28
-    classifier = LogisticRegression(input=x, n_in=n_dim, n_out=n_label)
-
-    # the cost we minimize during training is the negative log likelihood of
-    # the model in symbolic format
-    cost = classifier.negative_log_likelihood(y)
-
-    # compiling a Theano function that computes the mistakes that are made by
-    # the model on a minibatch
-    test_model = theano.function(inputs=[index],
-            outputs=classifier.errors(y),
-            givens={
-                x: test_set_x[index * batch_size: (index + 1) * batch_size],
-                y: test_set_y[index * batch_size: (index + 1) * batch_size]})
-
-    validate_model = theano.function(inputs=[index],
-            outputs=classifier.errors(y),
-            givens={
-                x: valid_set_x[index * batch_size:(index + 1) * batch_size],
-                y: valid_set_y[index * batch_size:(index + 1) * batch_size]})
-
-    # compute the gradient of cost with respect to theta = (W,b)
-    g_W = T.grad(cost=cost, wrt=classifier.W)
-    g_b = T.grad(cost=cost, wrt=classifier.b)
-
-    # specify how to update the parameters of the model as a list of
-    # (variable, update expression) pairs.
-    updates = [(classifier.W, classifier.W - learning_rate * g_W),
-               (classifier.b, classifier.b - learning_rate * g_b)]
-
-    # compiling a Theano function `train_model` that returns the cost, but in
-    # the same time updates the parameter of the model based on the rules
-    # defined in `updates`
-    train_model = theano.function(inputs=[index],
-            outputs=cost,
-            updates=updates,
-            givens={
-                x: train_set_x[index * batch_size:(index + 1) * batch_size],
-                y: train_set_y[index * batch_size:(index + 1) * batch_size]})
-
-    ###############
-    # TRAIN MODEL #
-    ###############
-    print '... training the model'
-    # early-stopping parameters
-    patience = 50000  # look as this many examples regardless
-    patience_increase = 100  # wait this much longer when a new best is
-                                  # found
-    improvement_threshold = 0.995  # a relative improvement of this much is
-                                  # considered significant
-    validation_frequency = min(n_train_batches, patience / 2)
-                                  # go through this many
-                                  # minibatche before checking the network
-                                  # on the validation set; in this case we
-                                  # check every epoch
-
-    best_params = None
-    best_validation_loss = numpy.inf
-    test_score = 0.
-    start_time = time.clock()
-
-    done_looping = False
-    epoch = 0
-    while True:
-        epoch = epoch + 1
-        for minibatch_index in xrange(n_train_batches):
-
-            minibatch_avg_cost = train_model(minibatch_index)
-            # iteration number
-            iter = (epoch - 1) * n_train_batches + minibatch_index
-
-            if (iter + 1) % validation_frequency == 0:
-                # compute zero-one loss on validation set
-                validation_losses = [validate_model(i)
-                                     for i in xrange(n_valid_batches)]
-                this_validation_loss = numpy.mean(validation_losses)
-
-                print('epoch %i, minibatch %i/%i, validation error %f %%' % \
-                    (epoch, minibatch_index + 1, n_train_batches,
-                    this_validation_loss * 100.))
-
-                # if we got the best validation score until now
-                if this_validation_loss < best_validation_loss:
-                    #improve patience if loss improvement is good enough
-                    if this_validation_loss < best_validation_loss *  \
-                       improvement_threshold:
-                        patience = max(patience, iter * patience_increase)
-
-                    best_validation_loss = this_validation_loss
-                    # test it on the test set
-
-                    test_losses = [test_model(i)
-                                   for i in xrange(n_test_batches)]
-                    test_score = numpy.mean(test_losses)
-
-                    print(('     epoch %i, minibatch %i/%i, test error of best'
-                       ' model %f %%') %
-                        (epoch, minibatch_index + 1, n_train_batches,
-                         test_score * 100.))
-
-            #if patience <= iter:
-                #done_looping = True
-                #break
-
-    end_time = time.clock()
-    print(('Optimization complete with best validation score of %f %%,'
-           'with test performance %f %%') %
-                 (best_validation_loss * 100., test_score * 100.))
-    print 'The code run for %d epochs, with %f epochs/sec' % (
-        epoch, 1. * epoch / (end_time - start_time))
-    print >> sys.stderr, ('The code for file ' +
-                          os.path.split(__file__)[1] +
-                          ' ran for %.1fs' % ((end_time - start_time)))
+def sgd_predict(model_file_name, test_file_name, pred_file_name, n_dim):
+  logger.info('loading test file')
+  (test_set_x, test_set_y) = ml_util.svm2numpy(test_file_name, n_dim)
+  logger.info('predicting')
+  f = open(pred_file_name, 'w')
+  for label in get_y_pred(model_file_name, test_set_x):
+    f.write(str(label)+'\n')
 
 if __name__ == '__main__':
-    sgd_optimization_mnist()
+  # logger setup
+  logging.basicConfig(level=logging.INFO)
+
+  # parser setup
+  parser = argparse.ArgumentParser(
+    description='Logistic SGD GPU version \n' +
+                'the data set should be in LIBSVM format(http://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/)',
+    epilog='train model: \n' +
+           __file__ + ' -t --train train.svm --test test.svm --model model.npy -d 784 -l 10 \n' +
+           'prediction: \n' +
+           __file__ + ' -p --model model.npy --test test.svm --pred pred.out -d 784 -l 10',
+    formatter_class=argparse.RawTextHelpFormatter)
+  parser.add_argument('-t', action='store_true', default=False, help='train mode')
+  parser.add_argument('-p', action='store_true', default=False, help='prediction mode')
+  parser.add_argument('--train', action='store', default=None, help='train file name', dest='train_file_name')
+  parser.add_argument('--test', action='store', default=None, help='test file name', dest='test_file_name')
+  parser.add_argument('--model', action='store', default=None, help='model file name', dest='model_file_name')
+  parser.add_argument('--pred', action='store', default=None, help='predict file name', dest='pred_file_name')
+  parser.add_argument('-d', action='store', default=0, help='length of feature dimension', type=int)
+  parser.add_argument('-l', action='store', default=0, help='number of label', type=int)
+  args = parser.parse_args()
+
+  if (args.t == False and args.p == False) or (args.t == True and args.p == True):
+    logger.info('Unknown mode')
+    exit()
+
+  if args.t == True:
+    logger.info('train mode')
+    if args.train_file_name == None:
+      logger.info('missing train file name')
+    elif args.test_file_name == None:
+      logger.info('missing test file name')
+    elif args.model_file_name == None:
+      logger.info('missing model file name')
+    elif args.d <= 0:
+      logger.info('missing or wrong length of feature dimension')
+    elif args.l <= 0:
+      logger.info('missing or wrong number of label')
+    else:
+      sgd_train(args.train_file_name, args.test_file_name, args.model_file_name, args.d, args.l)
+  elif args.p == True:
+    logger.info('prediction mode')
+    if args.model_file_name == None:
+      logger.info('missing model file name')
+    elif args.test_file_name == None:
+      logger.info('missing test file name')
+    elif args.pred_file_name == None:
+      logger.info('missing pred file name')
+    elif args.d <= 0:
+      logger.info('missing or wrong length of feature dimension')
+    elif args.l <= 0:
+      logger.info('missing or wrong number of label')
+    else:
+      sgd_predict(args.model_file_name, args.test_file_name, args.pred_file_name, args.d)
+  exit()
