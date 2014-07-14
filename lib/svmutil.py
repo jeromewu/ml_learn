@@ -4,6 +4,7 @@ import os, sys
 sys.path = [os.path.dirname(os.path.abspath(__file__))] + sys.path 
 from svm import *
 
+
 def svm_read_problem(data_file_name):
 	"""
 	svm_read_problem(data_file_name) -> [y, x]
@@ -113,6 +114,7 @@ def svm_train(arg1, arg2=None, arg3=None):
 	    -v n: n-fold cross validation mode
 	    -q : quiet mode (no outputs)
 	"""
+
 	prob, param = None, None
 	if isinstance(arg1, (list, tuple)):
 		assert isinstance(arg2, (list, tuple))
@@ -149,11 +151,11 @@ def svm_train(arg1, arg2=None, arg3=None):
 		libsvm.svm_cross_validation(prob, param, nr_fold, target)	
 		ACC, MSE, SCC = evaluations(prob.y[:l], target[:l])
 		if param.svm_type in [EPSILON_SVR, NU_SVR]:
-			print("Cross Validation Mean squared error = %g" % MSE)
-			print("Cross Validation Squared correlation coefficient = %g" % SCC)
+			print_null("Cross Validation Mean squared error = %g" % MSE)
+			print_null("Cross Validation Squared correlation coefficient = %g" % SCC)
 			return MSE
 		else:
-			print("Cross Validation Accuracy = %g%%" % ACC)
+			print_null("Cross Validation Accuracy = %g%%" % ACC)
 			return ACC
 	else:
 		m = libsvm.svm_train(prob, param)
@@ -188,7 +190,6 @@ def svm_predict(y, x, m, options=""):
 
 	def info(s):
 		print(s)
-
 	predict_probability = 0
 	argv = options.split()
 	i = 0
@@ -248,7 +249,7 @@ def svm_predict(y, x, m, options=""):
 		info("Mean squared error = %g (regression)" % MSE)
 		info("Squared correlation coefficient = %g (regression)" % SCC)
 	else:
-		info("Accuracy = %g%% (%d/%d) (classification)" % (ACC, int(l*ACC/100), l))
+		print_null("Accuracy = %g%% (%d/%d) (classification)" % (ACC, int(l*ACC/100), l))
 
 	return pred_labels, (ACC, MSE, SCC), pred_values
 
