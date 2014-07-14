@@ -1,4 +1,3 @@
 ./*/*.pyc
 ./*/makefile
-./data/*.npy
-./data/*.out
+./data
